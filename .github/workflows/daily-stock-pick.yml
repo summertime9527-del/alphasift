@@ -1,4 +1,4 @@
-name: Daily A-share Stock Picks
+name: Daily A-share Top 10
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ permissions:
 jobs:
   screen-and-notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     env:
       TZ: Asia/Shanghai
@@ -20,7 +20,7 @@ jobs:
       FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
       DAILY_SOURCE: auto
       DAILY_ENRICH_ENABLED: "true"
-      DAILY_ENRICH_MAX_CANDIDATES: "40"
+      DAILY_ENRICH_MAX_CANDIDATES: "60"
 
     steps:
       - name: Checkout repository
@@ -41,7 +41,7 @@ jobs:
         run: |
           alphasift screen momentum_quality \
             --no-llm \
-            --max-output 20 \
+            --max-output 30 \
             --save-run \
             > alphasift-output.json
 
@@ -75,11 +75,11 @@ jobs:
               )
           )
 
-          raw_picks = source.get("picks", [])[:20]
+          raw_picks = source.get("picks", [])[:30]
 
-          if len(raw_picks) < 5:
+          if len(raw_picks) < 10:
               raise RuntimeError(
-                  f"AlphaSift候选不足5只，当前只有{len(raw_picks)}只"
+                  f"AlphaSift候选不足10只，当前只有{len(raw_picks)}只"
               )
 
           def normalize_code(value):
@@ -127,12 +127,14 @@ jobs:
           2. 趋势、成交量和换手率；
           3. 基本面质量及估值合理性；
           4. 追高风险、流动性风险和回撤风险；
-          5. 行业分散。
+          5. 行业分散；
+          6. 避免名单被银行、保险等单一板块占据。
 
           必须遵守以下规则：
-          - 返回10只排序候选，供程序最终选择5只；
-          - 同一行业尽量只保留1只；
+          - 返回20只按优先级排列的候选；
+          - 同一行业尽量不超过1只；
           - 银行股最多1只；
+          - 优先选择趋势与基本面能够相互验证的股票；
           - 不得添加候选名单之外的股票；
           - 股票代码必须保持6位字符串；
           - 必须只返回JSON对象；
@@ -158,8 +160,8 @@ jobs:
           """
 
           user_prompt = (
-              "以下是AlphaSift从A股全市场初筛出的候选。"
-              "请严格按照规定JSON格式重新排序：\n"
+              "以下是AlphaSift从A股全市场初筛出的30只候选。"
+              "请选出并排序20只，严格返回JSON：\n"
               + json.dumps(
                   candidates,
                   ensure_ascii=False,
@@ -185,7 +187,7 @@ jobs:
               "thinking": {
                   "type": "disabled"
               },
-              "max_tokens": 3000,
+              "max_tokens": 5000,
               "stream": False
           }
 
@@ -196,7 +198,7 @@ jobs:
                   "Content-Type": "application/json"
               },
               json=api_payload,
-              timeout=180
+              timeout=240
           )
 
           if not api_response.ok:
@@ -257,67 +259,85 @@ jobs:
 
           selected = []
           used_codes = set()
-          used_sectors = set()
+          sector_counts = {}
           bank_count = 0
 
-          for item in recommendations:
-              if not isinstance(item, dict):
-                  continue
+          def add_candidates(max_per_sector):
+              global bank_count
 
-              code = normalize_code(item.get("code"))
+              for item in recommendations:
+                  if len(selected) >= 10:
+                      return
 
-              if code not in candidate_map:
-                  continue
+                  if not isinstance(item, dict):
+                      continue
 
-              if code in used_codes:
-                  continue
+                  code = normalize_code(item.get("code"))
 
-              base = candidate_map[code]
-              name = str(base.get("name") or "")
-              is_bank = "银行" in name
+                  if code not in candidate_map:
+                      continue
 
-              if is_bank and bank_count >= 1:
-                  continue
+                  if code in used_codes:
+                      continue
 
-              sector = str(
-                  item.get("sector")
-                  or base.get("industry")
-                  or ""
-              ).strip()
+                  base = candidate_map[code]
+                  name = str(base.get("name") or "")
+                  is_bank = "银行" in name
 
-              sector_key = (
-                  sector.lower()
-                  if sector
-                  else f"unknown-{code}"
-              )
+                  if is_bank and bank_count >= 1:
+                      continue
 
-              if sector_key in used_sectors:
-                  continue
+                  sector = str(
+                      item.get("sector")
+                      or base.get("industry")
+                      or ""
+                  ).strip()
 
-              merged = dict(base)
+                  sector_key = (
+                      sector.lower()
+                      if sector
+                      else f"unknown-{code}"
+                  )
 
-              merged.update({
-                  "sector": sector or "暂无行业信息",
-                  "ai_score": item.get("ai_score"),
-                  "reason": item.get("reason"),
-                  "catalyst": item.get("catalyst"),
-                  "risk": item.get("risk"),
-                  "invalidator": item.get("invalidator")
-              })
+                  current_count = sector_counts.get(
+                      sector_key,
+                      0
+                  )
 
-              selected.append(merged)
-              used_codes.add(code)
-              used_sectors.add(sector_key)
+                  if current_count >= max_per_sector:
+                      continue
 
-              if is_bank:
-                  bank_count += 1
+                  merged = dict(base)
 
-              if len(selected) == 5:
-                  break
+                  merged.update({
+                      "sector": sector or "暂无行业信息",
+                      "ai_score": item.get("ai_score"),
+                      "reason": item.get("reason"),
+                      "catalyst": item.get("catalyst"),
+                      "risk": item.get("risk"),
+                      "invalidator": item.get("invalidator")
+                  })
 
-          if len(selected) < 5:
+                  selected.append(merged)
+                  used_codes.add(code)
+
+                  sector_counts[sector_key] = (
+                      current_count + 1
+                  )
+
+                  if is_bank:
+                      bank_count += 1
+
+          # 第一轮：同一行业最多1只
+          add_candidates(max_per_sector=1)
+
+          # 不足10只时，第二轮允许同一行业最多2只
+          if len(selected) < 10:
+              add_candidates(max_per_sector=2)
+
+          if len(selected) < 10:
               raise RuntimeError(
-                  "DeepSeek返回的有效跨行业候选不足5只，"
+                  "DeepSeek返回的有效候选不足10只，"
                   f"当前只有{len(selected)}只，已停止推送"
               )
 
@@ -350,7 +370,7 @@ jobs:
               (
                   f"**筛选过程：** 全市场"
                   f"{source.get('snapshot_count', '暂无')}只"
-                  f" → 初筛{len(raw_picks)}只 → Top 5"
+                  f" → 初筛{len(raw_picks)}只 → Top 10"
               ),
               "",
               (
@@ -428,7 +448,7 @@ jobs:
                   "template": "green",
                   "title": {
                       "tag": "plain_text",
-                      "content": "📈 每日A股跨行业候选"
+                      "content": "📈 每日A股跨行业 Top 10"
                   }
               },
               "elements": [
@@ -482,5 +502,5 @@ jobs:
                   f"飞书推送失败：{feishu_result}"
               )
 
-          print("跨行业Top 5已成功发送到飞书")
+          print("跨行业Top 10已成功发送到飞书")
           PY
