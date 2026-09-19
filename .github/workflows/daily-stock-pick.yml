@@ -1,0 +1,120 @@
+name: Daily A-share Stock Picks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 10 * * 1-5"
+
+permissions:
+  contents: read
+
+jobs:
+  screen-and-notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      TZ: Asia/Shanghai
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      LITELLM_MODEL: deepseek/deepseek-chat
+      FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+      FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install AlphaSift
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Screen the A-share market
+        run: |
+          alphasift screen balanced_alpha --save-run | tee alphasift-output.txt
+          test -s alphasift-output.txt
+
+      - name: Send results to Feishu
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import time
+          import hmac
+          import base64
+          import hashlib
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          import requests
+
+          webhook = os.environ["FEISHU_WEBHOOK_URL"].strip()
+          secret = os.environ.get("FEISHU_WEBHOOK_SECRET", "").strip()
+
+          report = Path("alphasift-output.txt").read_text(
+              encoding="utf-8",
+              errors="replace"
+          )
+
+          report = re.sub(r"\x1b\[[0-9;]*m", "", report).strip()
+
+          if not report:
+              raise RuntimeError("AlphaSift 没有产生选股结果")
+
+          report = report[-15000:]
+
+          date_text = datetime.now(
+              ZoneInfo("Asia/Shanghai")
+          ).strftime("%Y-%m-%d %H:%M")
+
+          message = (
+              "📈 AlphaSift 每日A股选股\n"
+              f"时间：{date_text}\n"
+              "策略：balanced_alpha（综合多因子）\n"
+              "范围：A股全市场\n\n"
+              f"{report}\n\n"
+              "提示：结果仅供研究，不构成投资建议。"
+          )
+
+          payload = {
+              "msg_type": "text",
+              "content": {
+                  "text": message
+              }
+          }
+
+          if secret:
+              timestamp = str(int(time.time()))
+              string_to_sign = f"{timestamp}\n{secret}"
+              sign = base64.b64encode(
+                  hmac.new(
+                      string_to_sign.encode("utf-8"),
+                      digestmod=hashlib.sha256
+                  ).digest()
+              ).decode("utf-8")
+
+              payload["timestamp"] = timestamp
+              payload["sign"] = sign
+
+          response = requests.post(
+              webhook,
+              json=payload,
+              timeout=30
+          )
+          response.raise_for_status()
+
+          result = response.json()
+          code = result.get("code", result.get("StatusCode", 0))
+
+          if code != 0:
+              raise RuntimeError(f"飞书推送失败：{result}")
+
+          print("AlphaSift 选股结果已成功发送到飞书")
+          PY
