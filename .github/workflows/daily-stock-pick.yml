@@ -19,6 +19,7 @@ jobs:
       LITELLM_MODEL: deepseek/deepseek-chat
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
       FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+      DAILY_SOURCE: auto
 
     steps:
       - name: Checkout repository
@@ -37,14 +38,14 @@ jobs:
 
       - name: Screen the A-share market
         run: |
-          alphasift screen balanced_alpha --save-run | tee alphasift-output.txt
-          test -s alphasift-output.txt
+          alphasift screen balanced_alpha --save-run > alphasift-output.json
+          python -m json.tool alphasift-output.json > /dev/null
 
-      - name: Send results to Feishu
+      - name: Format and send to Feishu
         run: |
           python - <<'PY'
           import os
-          import re
+          import json
           import time
           import hmac
           import base64
@@ -58,41 +59,123 @@ jobs:
           webhook = os.environ["FEISHU_WEBHOOK_URL"].strip()
           secret = os.environ.get("FEISHU_WEBHOOK_SECRET", "").strip()
 
-          report = Path("alphasift-output.txt").read_text(
-              encoding="utf-8",
-              errors="replace"
+          data = json.loads(
+              Path("alphasift-output.json").read_text(encoding="utf-8")
           )
 
-          report = re.sub(r"\x1b\[[0-9;]*m", "", report).strip()
+          picks = data.get("picks", [])[:5]
 
-          if not report:
-              raise RuntimeError("AlphaSift 没有产生选股结果")
+          if not picks:
+              raise RuntimeError("AlphaSift 没有返回候选股票")
 
-          report = report[-15000:]
+          def number(value, digits=2):
+              if value is None or value == "":
+                  return "暂无"
+              try:
+                  return f"{float(value):.{digits}f}"
+              except (TypeError, ValueError):
+                  return str(value)
+
+          def percent(value):
+              if value is None or value == "":
+                  return "暂无"
+              try:
+                  return f"{float(value):+.2f}%"
+              except (TypeError, ValueError):
+                  return str(value)
 
           date_text = datetime.now(
               ZoneInfo("Asia/Shanghai")
           ).strftime("%Y-%m-%d %H:%M")
 
-          message = (
-              "📈 AlphaSift 每日A股选股\n"
-              f"时间：{date_text}\n"
-              "策略：balanced_alpha（综合多因子）\n"
-              "范围：A股全市场\n\n"
-              f"{report}\n\n"
-              "提示：结果仅供研究，不构成投资建议。"
-          )
+          snapshot_count = data.get("snapshot_count", "暂无")
+          filtered_count = data.get("after_filter_count", "暂无")
+          llm_ranked = data.get("llm_ranked", False)
+          llm_status = "DeepSeek 已参与排序" if llm_ranked else "规则因子排序"
+
+          lines = [
+              f"**时间：** {date_text}",
+              "**策略：** balanced_alpha（综合多因子）",
+              f"**筛选过程：** {snapshot_count}只 → {filtered_count}只 → Top {len(picks)}",
+              f"**排序方式：** {llm_status}",
+              ""
+          ]
+
+          for index, pick in enumerate(picks, start=1):
+              rank = pick.get("rank") or index
+              name = pick.get("name") or "未知股票"
+              code = pick.get("code") or "未知代码"
+              score = number(pick.get("final_score"), 1)
+              price = number(pick.get("price"), 2)
+              change = percent(pick.get("change_pct"))
+
+              sector = (
+                  pick.get("llm_sector")
+                  or pick.get("industry")
+                  or "暂无行业信息"
+              )
+
+              reason = (
+                  pick.get("ranking_reason")
+                  or pick.get("llm_thesis")
+                  or "依据综合因子评分入选"
+              )
+
+              risks = pick.get("llm_risks") or []
+              if isinstance(risks, list):
+                  risks = "；".join(str(item) for item in risks)
+
+              risk = (
+                  pick.get("risk_summary")
+                  or risks
+                  or "暂无明确风险提示"
+              )
+
+              lines.extend([
+                  f"---\n**{rank}. {name}（{code}）**",
+                  f"综合评分：**{score}**",
+                  f"现价：{price}　涨跌：{change}",
+                  f"行业：{sector}",
+                  f"入选理由：{reason}",
+                  f"风险提示：{risk}"
+              ])
+
+          lines.extend([
+              "---",
+              "⚠️ 以上为量化筛选后的研究候选，不构成买卖建议。"
+          ])
+
+          card = {
+              "config": {
+                  "wide_screen_mode": True
+              },
+              "header": {
+                  "template": "green",
+                  "title": {
+                      "tag": "plain_text",
+                      "content": "📈 AlphaSift 每日A股选股"
+                  }
+              },
+              "elements": [
+                  {
+                      "tag": "div",
+                      "text": {
+                          "tag": "lark_md",
+                          "content": "\n".join(lines)
+                      }
+                  }
+              ]
+          }
 
           payload = {
-              "msg_type": "text",
-              "content": {
-                  "text": message
-              }
+              "msg_type": "interactive",
+              "card": card
           }
 
           if secret:
               timestamp = str(int(time.time()))
               string_to_sign = f"{timestamp}\n{secret}"
+
               sign = base64.b64encode(
                   hmac.new(
                       string_to_sign.encode("utf-8"),
@@ -116,5 +199,5 @@ jobs:
           if code != 0:
               raise RuntimeError(f"飞书推送失败：{result}")
 
-          print("AlphaSift 选股结果已成功发送到飞书")
+          print("格式化选股报告已成功发送到飞书")
           PY
