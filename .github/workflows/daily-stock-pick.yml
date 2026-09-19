@@ -15,11 +15,30 @@ jobs:
 
     env:
       TZ: Asia/Shanghai
+
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      LITELLM_MODEL: deepseek/deepseek-chat
+
+      LLM_CHANNELS: primary
+      LLM_PRIMARY_PROTOCOL: openai
+      LLM_PRIMARY_BASE_URL: https://api.deepseek.com/v1
+      LLM_PRIMARY_API_KEYS: ${{ secrets.DEEPSEEK_API_KEY }}
+      LLM_PRIMARY_MODELS: deepseek-v4-flash
+      LITELLM_MODEL: openai/deepseek-v4-flash
+
+      LLM_JSON_MODE: "true"
+      LLM_MAX_TOKENS: "4096"
+      LLM_MAX_RETRIES: "2"
+      LLM_MIN_COVERAGE: "0.60"
+
+      PORTFOLIO_DIVERSITY_ENABLED: "true"
+      PORTFOLIO_MAX_SAME_LLM_SECTOR: "1"
+      PORTFOLIO_CONCENTRATION_PENALTY: "20"
+
+      DAILY_SOURCE: auto
+      DAILY_ENRICH_ENABLED: "true"
+
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
       FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
-      DAILY_SOURCE: auto
 
     steps:
       - name: Checkout repository
@@ -38,8 +57,39 @@ jobs:
 
       - name: Screen the A-share market
         run: |
-          alphasift screen balanced_alpha --save-run > alphasift-output.json
+          alphasift screen momentum_quality \
+            --max-output 10 \
+            --save-run \
+            > alphasift-output.json
+
           python -m json.tool alphasift-output.json > /dev/null
+
+      - name: Verify DeepSeek ranking
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(
+              Path("alphasift-output.json").read_text(encoding="utf-8")
+          )
+
+          if not data.get("llm_ranked", False):
+              degradation = data.get("degradation", {})
+              raise RuntimeError(
+                  "DeepSeek 未完成选股重排，已停止推送，防止发送降级结果。"
+                  f" 诊断信息：{degradation}"
+              )
+
+          picks = data.get("picks", [])
+
+          if len(picks) < 5:
+              raise RuntimeError(
+                  f"有效候选股票不足5只，当前只有 {len(picks)} 只"
+              )
+
+          print("DeepSeek 排序成功，候选股票数量：", len(picks))
+          PY
 
       - name: Format and send to Feishu
         run: |
@@ -57,16 +107,18 @@ jobs:
           import requests
 
           webhook = os.environ["FEISHU_WEBHOOK_URL"].strip()
-          secret = os.environ.get("FEISHU_WEBHOOK_SECRET", "").strip()
+          secret = os.environ.get(
+              "FEISHU_WEBHOOK_SECRET",
+              ""
+          ).strip()
 
           data = json.loads(
-              Path("alphasift-output.json").read_text(encoding="utf-8")
+              Path("alphasift-output.json").read_text(
+                  encoding="utf-8"
+              )
           )
 
           picks = data.get("picks", [])[:5]
-
-          if not picks:
-              raise RuntimeError("AlphaSift 没有返回候选股票")
 
           def number(value, digits=2):
               if value is None or value == "":
@@ -84,20 +136,47 @@ jobs:
               except (TypeError, ValueError):
                   return str(value)
 
+          def text_list(value):
+              if not value:
+                  return ""
+              if isinstance(value, list):
+                  return "；".join(
+                      str(item) for item in value if item
+                  )
+              return str(value)
+
           date_text = datetime.now(
               ZoneInfo("Asia/Shanghai")
           ).strftime("%Y-%m-%d %H:%M")
 
-          snapshot_count = data.get("snapshot_count", "暂无")
-          filtered_count = data.get("after_filter_count", "暂无")
-          llm_ranked = data.get("llm_ranked", False)
-          llm_status = "DeepSeek 已参与排序" if llm_ranked else "规则因子排序"
+          snapshot_count = data.get(
+              "snapshot_count",
+              "暂无"
+          )
+          filtered_count = data.get(
+              "after_filter_count",
+              "暂无"
+          )
+
+          market_view = (
+              data.get("llm_market_view")
+              or "暂无市场观点"
+          )
+
+          selection_logic = (
+              data.get("llm_selection_logic")
+              or "趋势、质量、流动性和风险综合排序"
+          )
 
           lines = [
               f"**时间：** {date_text}",
-              "**策略：** balanced_alpha（综合多因子）",
-              f"**筛选过程：** {snapshot_count}只 → {filtered_count}只 → Top {len(picks)}",
-              f"**排序方式：** {llm_status}",
+              "**策略：** momentum_quality（趋势＋质量）",
+              f"**筛选范围：** A股全市场 {snapshot_count} 只",
+              f"**初筛结果：** {filtered_count} 只",
+              "**最终结果：** DeepSeek 重排后 Top 5",
+              "",
+              f"**市场观点：** {market_view}",
+              f"**选股逻辑：** {selection_logic}",
               ""
           ]
 
@@ -105,9 +184,21 @@ jobs:
               rank = pick.get("rank") or index
               name = pick.get("name") or "未知股票"
               code = pick.get("code") or "未知代码"
-              score = number(pick.get("final_score"), 1)
-              price = number(pick.get("price"), 2)
-              change = percent(pick.get("change_pct"))
+
+              score = number(
+                  pick.get("final_score"),
+                  1
+              )
+              price = number(
+                  pick.get("price"),
+                  2
+              )
+              change = percent(
+                  pick.get("change_pct")
+              )
+              turnover = percent(
+                  pick.get("turnover_rate")
+              )
 
               sector = (
                   pick.get("llm_sector")
@@ -115,15 +206,25 @@ jobs:
                   or "暂无行业信息"
               )
 
+              theme = (
+                  pick.get("llm_theme")
+                  or text_list(pick.get("concepts"))
+                  or "暂无主题信息"
+              )
+
               reason = (
                   pick.get("ranking_reason")
                   or pick.get("llm_thesis")
-                  or "依据综合因子评分入选"
+                  or "根据趋势、质量和综合评分入选"
               )
 
-              risks = pick.get("llm_risks") or []
-              if isinstance(risks, list):
-                  risks = "；".join(str(item) for item in risks)
+              catalysts = text_list(
+                  pick.get("llm_catalysts")
+              )
+
+              risks = text_list(
+                  pick.get("llm_risks")
+              )
 
               risk = (
                   pick.get("risk_summary")
@@ -131,18 +232,28 @@ jobs:
                   or "暂无明确风险提示"
               )
 
+              invalidators = text_list(
+                  pick.get("llm_invalidators")
+              )
+
               lines.extend([
                   f"---\n**{rank}. {name}（{code}）**",
                   f"综合评分：**{score}**",
-                  f"现价：{price}　涨跌：{change}",
+                  f"现价：{price}",
+                  f"当日涨跌：{change}",
+                  f"换手率：{turnover}",
                   f"行业：{sector}",
+                  f"主题：{theme}",
                   f"入选理由：{reason}",
-                  f"风险提示：{risk}"
+                  f"催化因素：{catalysts or '暂无'}",
+                  f"风险提示：{risk}",
+                  f"失效条件：{invalidators or '暂无'}"
               ])
 
           lines.extend([
               "---",
-              "⚠️ 以上为量化筛选后的研究候选，不构成买卖建议。"
+              "⚠️ 以上是量化筛选和AI排序后的研究候选，"
+              "不构成任何买卖建议。"
           ])
 
           card = {
@@ -174,7 +285,9 @@ jobs:
 
           if secret:
               timestamp = str(int(time.time()))
-              string_to_sign = f"{timestamp}\n{secret}"
+              string_to_sign = (
+                  f"{timestamp}\n{secret}"
+              )
 
               sign = base64.b64encode(
                   hmac.new(
@@ -194,10 +307,15 @@ jobs:
           response.raise_for_status()
 
           result = response.json()
-          code = result.get("code", result.get("StatusCode", 0))
+          code = result.get(
+              "code",
+              result.get("StatusCode", 0)
+          )
 
           if code != 0:
-              raise RuntimeError(f"飞书推送失败：{result}")
+              raise RuntimeError(
+                  f"飞书推送失败：{result}"
+              )
 
-          print("格式化选股报告已成功发送到飞书")
+          print("选股报告已成功发送到飞书")
           PY
